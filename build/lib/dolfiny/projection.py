@@ -1,5 +1,4 @@
-import dolfinx 
-from dolfinx.fem import assemble_vector, apply_lifting, set_bc, assemble_matrix,form
+from dolfinx.fem import assemble_vector, apply_lifting, set_bc, assemble_matrix
 import ufl
 from petsc4py import PETSc
 
@@ -12,9 +11,8 @@ def project(v, target_func, bcs=[]):
     # Define variational problem for projection
     w = ufl.TestFunction(V)
     Pv = ufl.TrialFunction(V)
-
-    a = form( ufl.inner(Pv, w) * dx)
-    L = form(ufl.inner(v, w) * dx)
+    a = ufl.inner(Pv, w) * dx
+    L = ufl.inner(v, w) * dx
 
     # Assemble linear system
     A = assemble_matrix(a, bcs)

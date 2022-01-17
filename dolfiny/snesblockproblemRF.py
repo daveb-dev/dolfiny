@@ -5,14 +5,17 @@ from mpi4py import MPI
 
 import dolfinx
 import dolfinx.fem
+from dolfinx.fem import extract_function_spaces
+
 import ufl
 from dolfiny.function import functions_to_vec, vec_to_functions
+
 from dolfiny.utils import pprint
 from petsc4py import PETSc
 
 
 class SNESBlockProblem():
-    def __init__(self, F_form: typing.List, u: typing.List, bcs=[], J_form=None,
+    def __init__(self, F_form: typing.List,  u: typing.List, bcs=[], J_form=None,
                  nest=False, restriction=None, prefix=None):
         """SNES problem and solver wrapper
 
@@ -26,20 +29,29 @@ class SNESBlockProblem():
         J_form
         nest: False
             True for 'matnest' data layout, False for 'aij'
+        nullspace: optional
         restriction: optional
             ``Restriction`` class used to provide information about degree-of-freedom
             indices for which this solver should solve.
 
         """
-        #self.F_form = F_form
-        self.u = u
-        self.F_form = [None for i  in range(len(self.u))]
-        
-        for i in range(len(self.u)):
-            self.F_form[i]= dolfinx.fem.form(F_form[i])
+        self.F_form = F_form
 
-        #if not len(self.F_form) > 0:
-        #    raise RuntimeError("List of provided residual forms is empty!")
+        try:
+            self.F_form = [dolfinx.fem.form(_F) for _F in F_form]
+        except TypeError:
+            self.F_form = dolfinx.fem.form(F_form)
+
+        self.u = u
+        self.P = None 
+        self.rP = None 
+        self.nest = nest
+        self.restriction = restriction
+        self.nsp = None
+        self.prefix = prefix 
+
+        if not len(self.F_form) > 0:
+            raise RuntimeError("List of provided residual forms is empty!")
 
         if not len(self.u) > 0:
             raise RuntimeError("List of provided solution functions is empty!")
@@ -47,8 +59,9 @@ class SNESBlockProblem():
         if not isinstance(self.u[0], dolfinx.fem.Function):
             raise RuntimeError("Provided solution function not of type dolfinx.Function!")
 
+        #self.comm = self.u[0].function_space.mesh.mpi_comm()
         self.comm = self.u[0].function_space.mesh.comm
-        
+
         if J_form is None:
             self.J_form = [[None for i in range(len(self.u))] for j in range(len(self.u))]
             preserve_geometry_types = (ufl.CellVolume, ufl.FacetArea)
@@ -79,6 +92,8 @@ class SNESBlockProblem():
         else:
             self.J_form = dolfinx.fem.form(J_form)
 
+        
+        
         self.bcs = bcs
         self.restriction = restriction
 
@@ -102,16 +117,18 @@ class SNESBlockProblem():
 
             self.J = dolfinx.fem.create_matrix_nest(self.J_form)
             self.F = dolfinx.fem.create_vector_nest(self.F_form)
+
+
             self.x = self.F.copy()
 
-            self.snes.setFunction(self._F_nest, self.F)
-            self.snes.setJacobian(self._J_nest, self.J)
-            self.snes.setMonitor(self._monitor_nest)
+
 
         else:
             self.J = dolfinx.fem.create_matrix_block(self.J_form)
             self.F = dolfinx.fem.create_vector_block(self.F_form)
+
             self.x = self.F.copy()
+
 
             if restriction is not None:
                 # Need to create new global matrix for the restriction
@@ -119,21 +136,43 @@ class SNESBlockProblem():
                 self._J.assemble()
 
                 self._x = self.x.copy()
-
-                self.rJ = restriction.restrict_matrix(self._J)
+                self.rJ = restriction.restrict_matrix(self._J)                
                 self.rF = restriction.restrict_vector(self.F)
                 self.rx = restriction.restrict_vector(self._x)
 
+    def user_preconditioner(self,P_form:typing.List):
+        self.P_form = P_form 
+        if self.nest:
+           self.P = dolfinx.fem.create_matrix_nest(P_form) 
+        else:
+            self.P = dolfinx.fem.create_matrix_block(P_form)
+            if self.restriction is not None:
+                self.rP = self.restriction.restrict_matrix(self._P)
+
+
+    def set_snes_operators(self,nullspace=None):
+        if nullspace:
+            self.nsp = nullspace
+
+        if self.nest:
+            self.snes.setFunction(self._F_nest, self.F)
+            self.snes.setJacobian(self._J_nest, self.J, P= self.P)
+            self.snes.setMonitor(self._monitor_nest)
+        else:
+            if self.restriction is not None:
                 self.snes.setFunction(self._F_block, self.rF)
-                self.snes.setJacobian(self._J_block, self.rJ)
+                self.snes.setJacobian(self._J_block, self.rJ,P=self.rP)
+
             else:
                 self.snes.setFunction(self._F_block, self.F)
-                self.snes.setJacobian(self._J_block, self.J)
-
-            self.snes.setMonitor(self._monitor_block)
-
+                
+                self.snes.setJacobian(self._J_block, self.J, P=self.P)
+        
+        
+        self.snes.setMonitor(self._monitor_block)
+        
         self.snes.setConvergenceTest(self._converged)
-        self.snes.setOptionsPrefix(prefix)
+        self.snes.setOptionsPrefix(self.prefix)
         self.snes.setFromOptions()
 
     def update_functions(self, x):
@@ -162,17 +201,20 @@ class SNESBlockProblem():
     def _F_nest(self, snes, x, F):
         vec_to_functions(x, self.u)
         x = x.getNestSubVecs()
+        bcs1 = dolfinx.fem.bcs_by_block(extract_function_spaces(self.J_form, 1), self.bcs)
 
-        bcs1 = dolfinx.cpp.fem.bcs_cols(dolfinx.fem.assemble._create_cpp_form(self.J_form), self.bcs)
-        for L, F_sub, a, bc in zip(self.F_form, F.getNestSubVecs(), self.J_form, bcs1):
+        #bcs1 = dolfinx.cpp.fem.bcs_cols(dolfinx.fem.assemble._create_cpp_form(self.J_form), self.bcs)
+
+        for L, F_sub, a in zip(self.F_form, F.getNestSubVecs(), self.J_form):
             with F_sub.localForm() as F_sub_local:
                 F_sub_local.set(0.0)
             dolfinx.fem.assemble_vector(F_sub, L)
-            dolfinx.fem.apply_lifting(F_sub, a, bc, x0=x, scale=-1.0)
+            dolfinx.fem.apply_lifting(F_sub, a, bcs=bcs1, x0=x, scale=-1.0)
             F_sub.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
 
         # Set bc value in RHS
-        bcs0 = dolfinx.cpp.fem.bcs_rows(dolfinx.fem.assemble._create_cpp_form(self.F_form), self.bcs)
+        bcs0 = dolfinx.fem.bcs_by_block(extract_function_spaces(self.F_form), self.bcs)
+        
         for F_sub, bc, u_sub in zip(F.getNestSubVecs(), bcs0, x):
             dolfinx.fem.set_bc(F_sub, bc, u_sub, -1.0)
 
@@ -188,11 +230,22 @@ class SNESBlockProblem():
 
         if self.restriction is not None:
             self.restriction.restrict_matrix(self.J).copy(self.rJ)
+        
 
     def _J_nest(self, snes, u, J, P):
         self.J.zeroEntries()
         dolfinx.fem.assemble_matrix_nest(self.J, self.J_form, self.bcs, diagonal=1.0)
         self.J.assemble()
+        #here add null space
+        if self.nsp:
+            self.J.setNullSpace(self.nsp)
+
+        if self.P is not None:
+            P.zeroEntries()
+            dolfinx.fem.assemble_matrix_nest(P, self.P_form, self.bcs, diagonal=1.0)
+            P.assemble()
+
+
 
     def _converged(self, snes, it, norms):
         it = snes.getIterationNumber()
@@ -310,5 +363,6 @@ class SNESBlockProblem():
         else:
             self.snes.solve(None, self.x)
             vec_to_functions(self.x, self.solution)
+
 
         return self.solution

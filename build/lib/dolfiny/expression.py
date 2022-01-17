@@ -110,9 +110,9 @@ def linearise(e, u, u0=None):
         if isinstance(u, list):
             u0 = []
             for v in u:
-                u0.append(dolfinx.fem.Function(v.function_space, name=v.name + '_0'))
+                u0.append(dolfinx.Function(v.function_space, name=v.name + '_0'))
         else:
-            u0 = dolfinx.fem.Function(u.function_space, name=u.name + '_0')
+            u0 = dolfinx.Function(u.function_space, name=u.name + '_0')
 
     e0 = evaluate(e, u, u0)
     deu = derivative(e, u, u, u0)
@@ -150,16 +150,16 @@ def assemble(e, dx):
     shape = ufl.shape(e)
 
     if rank == 0:
-        f_ = MPI.COMM_WORLD.allreduce(dolfinx.fem.assemble_scalar(dolfinx.fem.form(e * dx)), op=MPI.SUM)
+        f_ = MPI.COMM_WORLD.allreduce(dolfinx.fem.assemble_scalar(e * dx), op=MPI.SUM)
     elif rank == 1:
         f_ = np.zeros(shape)
         for row in range(shape[0]):
-            f_[row] = MPI.COMM_WORLD.allreduce(dolfinx.fem.assemble_scalar(dolfinx.fem.form(e[row] * dx)), op=MPI.SUM)
+            f_[row] = MPI.COMM_WORLD.allreduce(dolfinx.fem.assemble_scalar(e[row] * dx), op=MPI.SUM)
     elif rank == 2:
         f_ = np.zeros(shape)
         for row in range(shape[0]):
             for col in range(shape[1]):
-                f_[row, col] = MPI.COMM_WORLD.allreduce(dolfinx.fem.assemble_scalar(dolfinx.fem.form(e[row, col] * dx)), op=MPI.SUM)
+                f_[row, col] = MPI.COMM_WORLD.allreduce(dolfinx.fem.assemble_scalar(e[row, col] * dx), op=MPI.SUM)
     return f_
 
 
@@ -182,7 +182,7 @@ def extract_linear_combination(e, linear_comb=[], scalar_weight=1.0):
 
     """
     from ufl.classes import Sum, Product, Division, ScalarValue
-    if isinstance(e, dolfinx.fem.Function):
+    if isinstance(e, dolfinx.Function):
         linear_comb.append((e, scalar_weight))
     elif isinstance(e, (Product, Division)):
         assert len(e.ufl_operands) == 2
